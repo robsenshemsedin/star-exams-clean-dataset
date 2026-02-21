@@ -1,0 +1,348 @@
+---
+title: "Statistical Analysis of Digital Access Patterns in Ethiopian Grade 12 Students"
+author: "Robsen Shemsedin Yusuf"
+date: "2026-02-12"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+# Introduction
+
+In this project, I analyze digital access patterns among Ethiopian Grade 12 students using anonymized data collected from my Android application, **Star Exams**, which I developed and published on the Google Play Store.
+
+The dataset contains 5,203 anonymized user records. Each record includes non-personal technical and geographic information such as region, cleaned city name, smartphone brand, and device tier classification (**budget**, **midrange**, **upper_midrange**). No personal identifiers such as names, phone numbers, or passwords are included.
+
+The goal of this analysis is to investigate regional disparities in smartphone access and evaluate whether device characteristics can predict a student's geographic region. Specifically, I aim to:
+
+- Estimate and compare device tier proportions across Ethiopian regions.
+- Test the association between region and device tier using chi-square inference.
+- Fit logistic and multinomial regression models.
+- Apply classification techniques such as LDA and QDA.
+- Compare models using AIC, BIC, and cross-validation.
+- Visualize patterns using barplots, confidence intervals, and confusion matrices.
+
+# Data source and preparation
+
+## Load required packages
+
+```{r packages}
+library(tidyverse)
+library(forcats)
+library(janitor)
+library(nnet)
+library(MASS)
+library(caret)
+```
+
+## Load dataset (local first, otherwise GitHub)
+
+```{r load-data}
+data_url  <- "https://raw.githubusercontent.com/robsenshemsedin/star-exams-clean-dataset/main/ethiopia_student_device_dataset.csv"
+local_csv <- "ethiopia_student_device_dataset.csv"
+
+if (file.exists(local_csv)) {
+  df_raw <- read.csv(local_csv, stringsAsFactors = FALSE)
+} else {
+  df_raw <- read.csv(data_url, stringsAsFactors = FALSE)
+}
+
+df <- janitor::clean_names(df_raw)
+glimpse(df)
+```
+
+## Data cleaning and formatting
+
+```{r cleaning}
+df <- df %>%
+  mutate(across(everything(), ~na_if(.x, ""))) %>%
+  mutate(
+    region = as.factor(region),
+    device_brand = as.factor(device_brand),
+    device_range = as.factor(device_range)
+  ) %>%
+  mutate(device_range = forcats::fct_relevel(device_range,
+                                             "budget",
+                                             "midrange",
+                                             "upper_midrange"))
+
+summary(df)
+```
+
+# Exploratory data analysis
+
+## Overall distribution of device tiers
+
+```{r tier-distribution}
+tier_overall <- df %>%
+  count(device_range) %>%
+  mutate(proportion = n / sum(n))
+
+tier_overall
+```
+
+**Interpretation:** This table shows the overall distribution of smartphone tiers used by students. A high proportion of budget devices suggests that many users rely on lower-end smartphones, which may affect the quality and reliability of digital learning.
+
+```{r plot-tier}
+ggplot(df, aes(x = device_range)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Overall Distribution of Smartphone Device Tiers",
+    x = "Device Tier",
+    y = "Number of Students"
+  )
+```
+
+## Device tier distribution by region
+
+```{r tier-region-table}
+tier_region <- df %>%
+  count(region, device_range) %>%
+  group_by(region) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+tier_region
+```
+
+**Interpretation:** This table compares regions by the proportion of budget, midrange, and upper-midrange devices. Differences across regions can reflect unequal access to higher-quality devices.
+
+```{r plot-tier-region}
+ggplot(tier_region, aes(x = region, y = prop, fill = device_range)) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Device Tier Proportion by Region",
+    x = "Region",
+    y = "Proportion",
+    fill = "Device Tier"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Confidence intervals for budget device share
+
+I estimate 95% confidence intervals for the proportion of budget devices within each region.
+
+```{r ci-budget}
+budget_ci <- df %>%
+  filter(!is.na(region), !is.na(device_range)) %>%
+  group_by(region) %>%
+  summarise(
+    n_region = n(),
+    x_budget = sum(device_range == "budget"),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    test = list(prop.test(x_budget, n_region)),
+    p_hat = x_budget / n_region,
+    conf_low = test$conf.int[1],
+    conf_high = test$conf.int[2]
+  ) %>%
+  ungroup()
+
+budget_ci
+```
+
+**Interpretation:** The confidence intervals show uncertainty around the estimated budget-device proportion in each region. Wider intervals usually occur in regions with smaller sample size.
+
+```{r plot-ci}
+ggplot(budget_ci, aes(x = reorder(region, p_hat), y = p_hat)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf_low, ymax = conf_high), width = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Budget Device Share by Region (95% CI)",
+    x = "Region",
+    y = "Estimated Proportion"
+  )
+```
+
+# Chi-square test of association
+
+I test whether device tier and region are statistically independent.
+
+- **H0:** Device tier is independent of region.
+- **H1:** Device tier distribution differs across regions.
+
+```{r chi-square}
+tab <- table(df$region, df$device_range)
+tab
+
+chi_test <- chisq.test(tab)
+chi_test
+
+min_expected <- min(chi_test$expected)
+min_expected
+```
+
+**Interpretation:** The p-value is extremely small, so I reject H0 and conclude that device tier distribution varies across regions.  
+Because the minimum expected count is small, I also compute a Monte Carlo p-value as a robustness check.
+
+```{r chi-square-mc}
+chi_mc <- chisq.test(tab, simulate.p.value = TRUE, B = 5000)
+chi_mc
+```
+
+# Logistic regression (Addis Ababa vs other regions)
+
+To simplify the classification problem, I group the outcome into **Addis** versus **Other**.
+
+```{r region-group}
+df <- df %>%
+  mutate(
+    region_group = ifelse(tolower(as.character(region)) == "addis ababa", "Addis", "Other"),
+    region_group = as.factor(region_group)
+  )
+
+table(df$region_group)
+```
+
+```{r logistic}
+d_log <- df %>%
+  dplyr::select(region_group, device_range, device_brand) %>%
+  tidyr::drop_na()
+
+log_model <- glm(region_group ~ device_range + device_brand,
+                 data = d_log,
+                 family = binomial)
+
+summary(log_model)
+
+AIC(log_model)
+BIC(log_model)
+```
+
+**Interpretation:** Logistic regression models the probability that a student is in **Addis** rather than **Other** given device tier and brand.  
+AIC and BIC are used for comparing models (lower values indicate a better trade-off between fit and complexity).
+
+# Multinomial logistic regression (predicting region)
+
+I fit a multinomial regression model to predict **region** using device tier and brand.
+
+```{r multinomial}
+d_multi <- df %>%
+  dplyr::select(region, device_range, device_brand) %>%
+  tidyr::drop_na()
+
+multi_model <- nnet::multinom(region ~ device_range + device_brand,
+                              data = d_multi,
+                              trace = FALSE)
+
+summary(multi_model)
+
+AIC(multi_model)
+BIC(multi_model)
+```
+
+**Interpretation:** Multinomial regression extends logistic regression to multiple region categories. It helps evaluate whether device characteristics contain useful information for predicting geography.
+
+# LDA and QDA classification (Addis vs other)
+
+I apply LDA and QDA to classify **Addis vs Other** using a compact numeric representation of device tier.
+
+## Train/test split
+
+```{r split}
+set.seed(123)
+
+d_cls <- df %>%
+  dplyr::select(region_group, device_range) %>%
+  tidyr::drop_na() %>%
+  mutate(
+    region_group = droplevels(as.factor(region_group)),
+    device_range = droplevels(as.factor(device_range))
+  )
+
+train_index <- caret::createDataPartition(d_cls$region_group, p = 0.8, list = FALSE)
+train <- d_cls[train_index, ]
+test  <- d_cls[-train_index, ]
+
+train_num <- train %>%
+  mutate(device_range_num = as.numeric(device_range)) %>%
+  dplyr::select(region_group, device_range_num)
+
+test_num <- test %>%
+  mutate(device_range_num = as.numeric(device_range)) %>%
+  dplyr::select(region_group, device_range_num)
+
+table(train_num$region_group)
+table(test_num$region_group)
+```
+
+## LDA
+
+```{r lda}
+lda_out <- tryCatch({
+  lda_model <- MASS::lda(region_group ~ device_range_num, data = train_num)
+  lda_pred <- predict(lda_model, newdata = test_num)$class
+  caret::confusionMatrix(lda_pred, test_num$region_group)
+}, error = function(e) {
+  cat("LDA could not be fitted: ", e$message, "\n")
+  NULL
+})
+
+lda_out
+```
+
+## QDA
+
+```{r qda}
+qda_out <- tryCatch({
+  qda_model <- MASS::qda(region_group ~ device_range_num, data = train_num)
+  qda_pred <- predict(qda_model, newdata = test_num)$class
+  caret::confusionMatrix(qda_pred, test_num$region_group)
+}, error = function(e) {
+  cat("QDA could not be fitted: ", e$message, "\n")
+  NULL
+})
+
+qda_out
+```
+
+**Interpretation:** The confusion matrices summarize classification performance on the test set. Accuracy measures overall correctness, while sensitivity/specificity show class-wise performance.
+
+# Cross-validation (5-fold)
+
+I estimate classification performance stability using 5-fold cross-validation.
+
+```{r cv}
+set.seed(123)
+
+control <- trainControl(method = "cv", number = 5)
+
+cv_lda <- caret::train(
+  region_group ~ device_range,
+  data = d_cls,
+  method = "lda",
+  trControl = control
+)
+
+cv_lda
+```
+
+**Interpretation:** Cross-validation evaluates the model on multiple splits of the data. This gives a more reliable estimate of performance than using a single train/test split.
+
+# Conclusion
+
+In this analysis, I studied digital access patterns among Ethiopian Grade 12 students using smartphone and regional data collected from my Star Exams application.
+
+I found clear regional differences in device tier distribution, supported by confidence intervals and a chi-square test of association. I then evaluated how well device characteristics predict region using logistic regression, multinomial regression, and classification methods (LDA/QDA). Finally, I used cross-validation to assess classification stability.
+
+Overall, the results provide evidence that smartphone access differs by region, which is consistent with regional disparities in digital learning readiness.
